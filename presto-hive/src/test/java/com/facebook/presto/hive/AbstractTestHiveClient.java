@@ -85,6 +85,10 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hive.metastore.TableType;
+import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.hadoop.hive.metastore.api.SerDeInfo;
+import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.serde2.ReaderWriterProfiler;
 import org.joda.time.DateTime;
@@ -241,6 +245,7 @@ public abstract class AbstractTestHiveClient
     protected SchemaTableName temporaryInsertTable;
     protected SchemaTableName temporaryInsertIntoNewPartitionTable;
     protected SchemaTableName temporaryInsertIntoExistingPartitionTable;
+    protected SchemaTableName temporaryInsertUnsupportedWriteType;
     protected SchemaTableName temporaryMetadataDeleteTable;
     protected SchemaTableName temporaryRenameTableOld;
     protected SchemaTableName temporaryRenameTableNew;
@@ -317,6 +322,7 @@ public abstract class AbstractTestHiveClient
         temporaryInsertTable = new SchemaTableName(database, "tmp_presto_test_insert_" + randomName());
         temporaryInsertIntoExistingPartitionTable = new SchemaTableName(database, "tmp_presto_test_insert_exsting_partitioned_" + randomName());
         temporaryInsertIntoNewPartitionTable = new SchemaTableName(database, "tmp_presto_test_insert_new_partitioned_" + randomName());
+        temporaryInsertUnsupportedWriteType = new SchemaTableName(database, "tmp_presto_test_insert_unsupported_type_" + randomName());
         temporaryMetadataDeleteTable = new SchemaTableName(database, "tmp_presto_test_metadata_delete_" + randomName());
         temporaryRenameTableOld = new SchemaTableName(database, "tmp_presto_test_rename_" + randomName());
         temporaryRenameTableNew = new SchemaTableName(database, "tmp_presto_test_rename_" + randomName());
@@ -386,6 +392,7 @@ public abstract class AbstractTestHiveClient
                         fileFormatColumn, Domain.create(ValueSet.ofRanges(Range.equal(VARCHAR, utf8Slice("textfile")), Range.equal(VARCHAR, utf8Slice("sequencefile")), Range.equal(VARCHAR, utf8Slice("rctext")), Range.equal(VARCHAR, utf8Slice("rcbinary"))), false),
                         dummyColumn, Domain.create(ValueSet.ofRanges(Range.equal(BIGINT, 1L), Range.equal(BIGINT, 2L), Range.equal(BIGINT, 3L), Range.equal(BIGINT, 4L)), false))),
                 Optional.empty(),
+                Optional.empty(),
                 Optional.of(ImmutableList.of(
                         TupleDomain.withColumnDomains(ImmutableMap.of(
                                 dsColumn, Domain.create(ValueSet.ofRanges(Range.equal(VARCHAR, utf8Slice("2012-12-29"))), false),
@@ -410,6 +417,7 @@ public abstract class AbstractTestHiveClient
                 new HiveTableLayoutHandle(clientId, unpartitionedPartitions, TupleDomain.all()),
                 Optional.empty(),
                 TupleDomain.all(),
+                Optional.empty(),
                 Optional.empty(),
                 Optional.of(ImmutableList.of(TupleDomain.all())),
                 ImmutableList.of());
@@ -455,6 +463,7 @@ public abstract class AbstractTestHiveClient
                 true,
                 typeManager,
                 locationService,
+                new TableParameterCodec(),
                 partitionUpdateCodec,
                 newFixedThreadPool(2));
         splitManager = new HiveSplitManager(
@@ -574,7 +583,7 @@ public abstract class AbstractTestHiveClient
         assertEquals(actualTableLayout.getPredicate(), expectedTableLayout.getPredicate());
         assertEquals(actualTableLayout.getDiscretePredicates().isPresent(), expectedTableLayout.getDiscretePredicates().isPresent());
         actualTableLayout.getDiscretePredicates().ifPresent(actual -> assertEqualsIgnoreOrder(actual, expectedTableLayout.getDiscretePredicates().get()));
-        assertEquals(actualTableLayout.getPartitioningColumns(), expectedTableLayout.getPartitioningColumns());
+        assertEquals(actualTableLayout.getStreamPartitioningColumns(), expectedTableLayout.getStreamPartitioningColumns());
         assertEquals(actualTableLayout.getLocalProperties(), expectedTableLayout.getLocalProperties());
     }
 
@@ -1373,6 +1382,18 @@ public abstract class AbstractTestHiveClient
     }
 
     @Test
+    public void testInsertUnsupportedWriteType()
+            throws Exception
+    {
+        try {
+            doInsertUnsupportedWriteType(ORC, temporaryInsertUnsupportedWriteType);
+        }
+        finally {
+            dropTable(temporaryInsertUnsupportedWriteType);
+        }
+    }
+
+    @Test
     public void testMetadataDelete()
             throws Exception
     {
@@ -1874,6 +1895,25 @@ public abstract class AbstractTestHiveClient
 
         // verify temp directory is empty
         assertTrue(listAllDataFiles(insertTableHandle).isEmpty());
+    }
+
+    private void doInsertUnsupportedWriteType(HiveStorageFormat storageFormat, SchemaTableName tableName)
+            throws Exception
+    {
+        List<FieldSchema> columns = ImmutableList.of(new FieldSchema("dummy", "int", null));
+        List<FieldSchema> partitionColumns = ImmutableList.of(new FieldSchema("name", "string", null));
+
+        createEmptyTable(tableName, storageFormat, columns, partitionColumns);
+
+        ConnectorSession session = newSession();
+        ConnectorTableHandle tableHandle = getTableHandle(tableName);
+        try {
+            metadata.beginInsert(session, tableHandle);
+            fail("expected failure");
+        }
+        catch (PrestoException e) {
+            assertEquals(e.getMessage(), "Inserting into Hive table with column type int not supported");
+        }
     }
 
     private void doInsertIntoExistingPartition(HiveStorageFormat storageFormat, SchemaTableName tableName)
@@ -2489,5 +2529,44 @@ public abstract class AbstractTestHiveClient
                 .put(STORAGE_FORMAT_PROPERTY, storageFormat)
                 .put(PARTITIONED_BY_PROPERTY, ImmutableList.copyOf(parititonedBy))
                 .build();
+    }
+
+    protected void createEmptyTable(SchemaTableName schemaTableName, HiveStorageFormat hiveStorageFormat, List<FieldSchema> columns, List<FieldSchema> partitionColumns)
+            throws Exception
+    {
+        ConnectorSession session = newSession();
+
+        String tableOwner = session.getUser();
+        String schemaName = schemaTableName.getSchemaName();
+        String tableName = schemaTableName.getTableName();
+
+        LocationService locationService = getLocationService(schemaName);
+        LocationHandle locationHandle = locationService.forNewTable(session.getQueryId(), schemaName, tableName);
+        Path targetPath = locationService.targetPathRoot(locationHandle);
+        HiveWriteUtils.createDirectory(hdfsEnvironment, targetPath);
+
+        SerDeInfo serdeInfo = new SerDeInfo();
+        serdeInfo.setName(tableName);
+        serdeInfo.setSerializationLib(hiveStorageFormat.getSerDe());
+        serdeInfo.setParameters(ImmutableMap.of());
+
+        StorageDescriptor sd = new StorageDescriptor();
+        sd.setLocation(targetPath.toString());
+        sd.setCols(columns);
+        sd.setSerdeInfo(serdeInfo);
+        sd.setInputFormat(hiveStorageFormat.getInputFormat());
+        sd.setOutputFormat(hiveStorageFormat.getOutputFormat());
+        sd.setParameters(ImmutableMap.of());
+
+        Table table = new Table();
+        table.setDbName(schemaName);
+        table.setTableName(tableName);
+        table.setOwner(tableOwner);
+        table.setTableType(TableType.MANAGED_TABLE.toString());
+        table.setParameters(ImmutableMap.of());
+        table.setPartitionKeys(partitionColumns);
+        table.setSd(sd);
+
+        getMetastoreClient(schemaName).createTable(table);
     }
 }

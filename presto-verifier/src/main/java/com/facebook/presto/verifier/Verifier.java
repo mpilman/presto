@@ -22,6 +22,8 @@ import io.airlift.event.client.EventClient;
 import io.airlift.log.Logger;
 import io.airlift.units.Duration;
 
+import java.io.Closeable;
+import java.io.IOException;
 import java.io.PrintStream;
 import java.util.List;
 import java.util.Set;
@@ -105,7 +107,7 @@ public class Verifier
                             true,
                             config.isVerboseResultsComparison(),
                             query);
-                    completionService.submit(validateTask(validator), validator);
+                    completionService.submit(validator::valid, validator);
                     queriesSubmitted++;
                 }
             }
@@ -156,6 +158,18 @@ public class Verifier
         }
 
         log.info("Results: %s / %s (%s skipped)", valid, failed, skipped);
+        log.info("");
+
+        for (EventClient eventClient : eventClients) {
+            if (eventClient instanceof Closeable) {
+                try {
+                    ((Closeable) eventClient).close();
+                }
+                catch (IOException ignored) { }
+                log.info("");
+            }
+        }
+
         return failed;
     }
 
@@ -223,18 +237,6 @@ public class Verifier
         catch (ExecutionException e) {
             throw Throwables.propagate(e);
         }
-    }
-
-    private static Runnable validateTask(final Validator validator)
-    {
-        return new Runnable()
-        {
-            @Override
-            public void run()
-            {
-                validator.valid();
-            }
-        };
     }
 
     private static boolean shouldAddStackTrace(Exception e)

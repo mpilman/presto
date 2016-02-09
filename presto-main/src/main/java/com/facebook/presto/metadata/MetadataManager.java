@@ -18,6 +18,7 @@ import com.facebook.presto.block.BlockEncodingManager;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorInsertTableHandle;
+import com.facebook.presto.spi.ConnectorNewTableLayout;
 import com.facebook.presto.spi.ConnectorOutputTableHandle;
 import com.facebook.presto.spi.ConnectorResolvedIndex;
 import com.facebook.presto.spi.ConnectorSession;
@@ -31,6 +32,7 @@ import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.SchemaTablePrefix;
 import com.facebook.presto.spi.block.BlockEncodingSerde;
 import com.facebook.presto.spi.connector.ConnectorMetadata;
+import com.facebook.presto.spi.connector.ConnectorPartitioningHandle;
 import com.facebook.presto.spi.connector.ConnectorTransactionHandle;
 import com.facebook.presto.spi.predicate.NullableValue;
 import com.facebook.presto.spi.predicate.TupleDomain;
@@ -46,9 +48,11 @@ import com.facebook.presto.type.TypeRegistry;
 import com.fasterxml.jackson.databind.JsonDeserializer;
 import com.google.common.base.Joiner;
 import com.google.common.collect.HashMultimap;
+import com.google.common.collect.ImmutableBiMap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Multimap;
 import io.airlift.json.JsonCodec;
 import io.airlift.json.JsonCodecFactory;
@@ -86,6 +90,7 @@ import static com.facebook.presto.metadata.TableLayout.fromConnectorLayout;
 import static com.facebook.presto.metadata.ViewDefinition.ViewColumn;
 import static com.facebook.presto.spi.StandardErrorCode.INVALID_VIEW;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_FOUND;
+import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
 import static com.facebook.presto.spi.StandardErrorCode.SYNTAX_ERROR;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.spi.type.BooleanType.BOOLEAN;
@@ -474,14 +479,57 @@ public class MetadataManager
     }
 
     @Override
-    public OutputTableHandle beginCreateTable(Session session, String catalogName, TableMetadata tableMetadata)
+    public Optional<NewTableLayout> getInsertLayout(Session session, TableHandle target)
+    {
+        List<TableLayout> layouts = getLayouts(session, target, new Constraint<>(TupleDomain.all(), map -> true), Optional.empty())
+                .stream()
+                .map(TableLayoutResult::getLayout)
+                .filter(layout -> layout.getNodePartitioning().isPresent())
+                .collect(toImmutableList());
+
+        if (layouts.isEmpty()) {
+            return Optional.empty();
+        }
+
+        if (layouts.size() > 1) {
+            throw new PrestoException(NOT_SUPPORTED, "Tables with multiple layouts can not be written");
+        }
+
+        TableLayout layout = Iterables.getOnlyElement(layouts);
+        ConnectorPartitioningHandle partitioningHandle = layout.getNodePartitioning().get().getPartitioningHandle().getConnectorHandle();
+
+        Map<ColumnHandle, String> columnNamesByHandle = ImmutableBiMap.copyOf(getColumnHandles(session, target)).inverse();
+        List<String> partitionColumns = layout.getNodePartitioning().get().getPartitioningColumns().stream()
+                .map(columnNamesByHandle::get)
+                .collect(toImmutableList());
+
+        return Optional.of(new NewTableLayout(
+                layout.getConnectorId(),
+                lookupConnectorFor(target).getTransactionHandle(session),
+                new ConnectorNewTableLayout(partitioningHandle, partitionColumns)));
+    }
+
+    @Override
+    public Optional<NewTableLayout> getNewTableLayout(Session session, String catalogName, TableMetadata tableMetadata)
     {
         ConnectorEntry entry = connectorsByCatalog.get(catalogName);
         checkArgument(entry != null, "Catalog %s does not exist", catalogName);
         ConnectorMetadata metadata = entry.getMetadataForWrite(session);
         ConnectorTransactionHandle transactionHandle = entry.getTransactionHandle(session);
         ConnectorSession connectorSession = session.toConnectorSession(entry.getCatalog());
-        ConnectorOutputTableHandle handle = metadata.beginCreateTable(connectorSession, tableMetadata.getMetadata());
+        return metadata.getNewTableLayout(connectorSession, tableMetadata.getMetadata())
+                .map(layout -> new NewTableLayout(entry.getConnectorId(), transactionHandle, layout));
+    }
+
+    @Override
+    public OutputTableHandle beginCreateTable(Session session, String catalogName, TableMetadata tableMetadata, Optional<NewTableLayout> layout)
+    {
+        ConnectorEntry entry = connectorsByCatalog.get(catalogName);
+        checkArgument(entry != null, "Catalog %s does not exist", catalogName);
+        ConnectorMetadata metadata = entry.getMetadataForWrite(session);
+        ConnectorTransactionHandle transactionHandle = entry.getTransactionHandle(session);
+        ConnectorSession connectorSession = session.toConnectorSession(entry.getCatalog());
+        ConnectorOutputTableHandle handle = metadata.beginCreateTable(connectorSession, tableMetadata.getMetadata(), layout.map(NewTableLayout::getLayout));
         return new OutputTableHandle(entry.getConnectorId(), transactionHandle, handle);
     }
 

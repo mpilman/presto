@@ -83,12 +83,14 @@ import com.facebook.presto.spi.PageBuilder;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.RecordSet;
 import com.facebook.presto.spi.block.SortOrder;
+import com.facebook.presto.spi.predicate.NullableValue;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.split.MappedRecordSet;
 import com.facebook.presto.split.PageSinkManager;
 import com.facebook.presto.split.PageSourceProvider;
 import com.facebook.presto.sql.gen.ExpressionCompiler;
 import com.facebook.presto.sql.parser.SqlParser;
+import com.facebook.presto.sql.planner.PartitionFunctionBinding.PartitionFunctionArgumentBinding;
 import com.facebook.presto.sql.planner.optimizations.IndexJoinOptimizer;
 import com.facebook.presto.sql.planner.plan.AggregationNode;
 import com.facebook.presto.sql.planner.plan.AggregationNode.Step;
@@ -162,6 +164,7 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import static com.facebook.presto.SystemSessionProperties.getTaskAggregationConcurrency;
@@ -185,6 +188,9 @@ import static com.facebook.presto.spi.type.BooleanType.BOOLEAN;
 import static com.facebook.presto.spi.type.TypeUtils.writeNativeValue;
 import static com.facebook.presto.sql.analyzer.ExpressionAnalyzer.getExpressionTypes;
 import static com.facebook.presto.sql.analyzer.ExpressionAnalyzer.getExpressionTypesFromInput;
+import static com.facebook.presto.sql.planner.SystemPartitioningHandle.COORDINATOR_DISTRIBUTION;
+import static com.facebook.presto.sql.planner.SystemPartitioningHandle.FIXED_BROADCAST_DISTRIBUTION;
+import static com.facebook.presto.sql.planner.SystemPartitioningHandle.SINGLE_DISTRIBUTION;
 import static com.facebook.presto.sql.planner.plan.JoinNode.Type.FULL;
 import static com.facebook.presto.sql.planner.plan.JoinNode.Type.RIGHT;
 import static com.facebook.presto.sql.planner.plan.TableWriterNode.CreateHandle;
@@ -211,6 +217,7 @@ public class LocalExecutionPlanner
 
     private final PageSourceProvider pageSourceProvider;
     private final IndexManager indexManager;
+    private final NodePartitioningManager nodePartitioningManager;
     private final PageSinkManager pageSinkManager;
     private final ExchangeClientSupplier exchangeClientSupplier;
     private final ExpressionCompiler compiler;
@@ -225,6 +232,7 @@ public class LocalExecutionPlanner
             SqlParser sqlParser,
             PageSourceProvider pageSourceProvider,
             IndexManager indexManager,
+            NodePartitioningManager nodePartitioningManager,
             PageSinkManager pageSinkManager,
             ExchangeClientSupplier exchangeClientSupplier,
             ExpressionCompiler compiler,
@@ -235,6 +243,7 @@ public class LocalExecutionPlanner
         requireNonNull(compilerConfig, "compilerConfig is null");
         this.pageSourceProvider = requireNonNull(pageSourceProvider, "pageSourceProvider is null");
         this.indexManager = requireNonNull(indexManager, "indexManager is null");
+        this.nodePartitioningManager = requireNonNull(nodePartitioningManager, "nodePartitioningManager is null");
         this.exchangeClientSupplier = exchangeClientSupplier;
         this.metadata = requireNonNull(metadata, "metadata is null");
         this.sqlParser = requireNonNull(sqlParser, "sqlParser is null");
@@ -250,41 +259,57 @@ public class LocalExecutionPlanner
     public LocalExecutionPlan plan(
             Session session,
             PlanNode plan,
-            List<Symbol> outputLayout,
             Map<Symbol, Type> types,
-            Optional<PartitionFunctionBinding> partitionFunctionBinding,
+            PartitionFunctionBinding functionBinding,
             SharedBuffer sharedBuffer,
             boolean singleNode,
             boolean allowLocalParallel)
     {
-        if (!partitionFunctionBinding.isPresent()) {
+        List<Symbol> outputLayout = functionBinding.getOutputLayout();
+        if (functionBinding.getPartitioningHandle().equals(FIXED_BROADCAST_DISTRIBUTION) ||
+                functionBinding.getPartitioningHandle().equals(SINGLE_DISTRIBUTION) ||
+                functionBinding.getPartitioningHandle().equals(COORDINATOR_DISTRIBUTION)) {
             return plan(session, plan, outputLayout, types, new TaskOutputFactory(sharedBuffer), singleNode, allowLocalParallel);
         }
 
-        PartitionFunctionBinding functionBinding = partitionFunctionBinding.get();
-
         // We can convert the symbols directly into channels, because the root must be a sink and therefore the layout is fixed
         List<Integer> partitionChannels;
+        List<Optional<NullableValue>> partitionConstants;
         List<Type> partitionChannelTypes;
         if (functionBinding.getHashColumn().isPresent()) {
             partitionChannels = ImmutableList.of(outputLayout.indexOf(functionBinding.getHashColumn().get()));
+            partitionConstants = ImmutableList.of(Optional.empty());
             partitionChannelTypes = ImmutableList.of(BIGINT);
         }
         else {
-            partitionChannels = functionBinding.getPartitioningColumns().stream()
+            partitionChannels = functionBinding.getPartitionFunctionArguments().stream()
+                    .map(PartitionFunctionArgumentBinding::getColumn)
                     .map(outputLayout::indexOf)
                     .collect(toImmutableList());
-            partitionChannelTypes = functionBinding.getPartitioningColumns().stream()
-                    .map(types::get)
+            partitionConstants = functionBinding.getPartitionFunctionArguments().stream()
+                    .map(argument -> {
+                        if (argument.isConstant()) {
+                            return Optional.of(argument.getConstant());
+                        }
+                        return Optional.<NullableValue>empty();
+                    })
+                    .collect(toImmutableList());
+            partitionChannelTypes = functionBinding.getPartitionFunctionArguments().stream()
+                    .map(argument -> {
+                        if (argument.isConstant()) {
+                            return argument.getConstant().getType();
+                        }
+                        return types.get(argument.getColumn());
+                    })
                     .collect(toImmutableList());
         }
 
-        PartitionFunction partitionFunction = functionBinding.getFunctionHandle().createPartitionFunction(functionBinding, partitionChannelTypes);
-
+        PartitionFunction partitionFunction = nodePartitioningManager.getPartitionFunction(session, functionBinding, partitionChannelTypes);
         OptionalInt nullChannel = OptionalInt.empty();
         if (functionBinding.isReplicateNulls()) {
-            checkArgument(functionBinding.getPartitioningColumns().size() == 1);
-            nullChannel = OptionalInt.of(outputLayout.indexOf(Iterables.getOnlyElement(functionBinding.getPartitioningColumns())));
+            checkArgument(functionBinding.getPartitionFunctionArguments().size() == 1);
+            checkArgument(functionBinding.getPartitionFunctionArguments().get(0).isVariable());
+            nullChannel = OptionalInt.of(outputLayout.indexOf(getOnlyElement(functionBinding.getPartitionFunctionArguments()).getColumn()));
         }
 
         return plan(
@@ -292,7 +317,7 @@ public class LocalExecutionPlanner
                 plan,
                 outputLayout,
                 types,
-                new PartitionedOutputFactory(partitionFunction, partitionChannels, nullChannel, sharedBuffer),
+                new PartitionedOutputFactory(partitionFunction, partitionChannels, partitionConstants, nullChannel, sharedBuffer),
                 singleNode,
                 allowLocalParallel);
     }
@@ -819,7 +844,7 @@ public class LocalExecutionPlanner
                 return planGlobalAggregation(context.getNextOperatorId(), node, source);
             }
 
-            if (node.getStep() == Step.INTERMEDIATE) {
+            if (needsLocalGather(node)) {
                 LocalExecutionPlanContext intermediateContext = context.createSubContext();
                 intermediateContext.setInputDriver(context.isInputDriver());
 
@@ -886,6 +911,22 @@ public class LocalExecutionPlanner
             operation = addInMemoryExchange(context, node.getId(), operation, parallelContext);
 
             return operation;
+        }
+
+        private boolean needsLocalGather(AggregationNode node)
+        {
+            // intermediate is used for node local aggregations
+            if (node.getStep() == Step.INTERMEDIATE) {
+                return true;
+            }
+
+            // a final aggregation with a partial as a source needs is used to signal a plan that is
+            // distributed on the grouped keys but not partitioned on the group keys.
+            if (node.getStep() != Step.FINAL || node.getSources().size() != 1) {
+                return false;
+            }
+            PlanNode source = node.getSources().get(0);
+            return source instanceof AggregationNode && ((AggregationNode) source).getStep() == Step.PARTIAL;
         }
 
         @Override
@@ -1025,7 +1066,7 @@ public class LocalExecutionPlanner
             try {
                 if (columns != null) {
                     CursorProcessor cursorProcessor = compiler.compileCursorProcessor(translatedFilter, translatedProjections, sourceNode.getId());
-                    PageProcessor pageProcessor = compiler.compilePageProcessor(translatedFilter, translatedProjections);
+                    Supplier<PageProcessor> pageProcessor = compiler.compilePageProcessor(translatedFilter, translatedProjections);
 
                     SourceOperatorFactory operatorFactory = new ScanFilterAndProjectOperator.ScanFilterAndProjectOperatorFactory(
                             context.getNextOperatorId(),
@@ -1040,7 +1081,7 @@ public class LocalExecutionPlanner
                     return new PhysicalOperation(operatorFactory, outputMappings);
                 }
                 else {
-                    PageProcessor processor = compiler.compilePageProcessor(translatedFilter, translatedProjections);
+                    Supplier<PageProcessor> processor = compiler.compilePageProcessor(translatedFilter, translatedProjections);
 
                     OperatorFactory operatorFactory = new FilterAndProjectOperator.FilterAndProjectOperatorFactory(
                             context.getNextOperatorId(),
@@ -1097,7 +1138,7 @@ public class LocalExecutionPlanner
                         sourceNode.getId(),
                         pageSourceProvider,
                         new GenericCursorProcessor(filterFunction, projectionFunctions),
-                        new GenericPageProcessor(filterFunction, projectionFunctions),
+                        () -> new GenericPageProcessor(filterFunction, projectionFunctions),
                         columns,
                         toTypes(projectionFunctions));
 
@@ -1107,7 +1148,7 @@ public class LocalExecutionPlanner
                 OperatorFactory operatorFactory = new FilterAndProjectOperator.FilterAndProjectOperatorFactory(
                         context.getNextOperatorId(),
                         planNodeId,
-                        new GenericPageProcessor(filterFunction, projectionFunctions),
+                        () -> new GenericPageProcessor(filterFunction, projectionFunctions),
                         toTypes(projectionFunctions));
                 return new PhysicalOperation(operatorFactory, outputMappings, source);
             }

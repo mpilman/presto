@@ -454,6 +454,25 @@ public abstract class AbstractTestDistributedQueries
     }
 
     @Test
+    public void testCompatibleTypeChangeForView()
+            throws Exception
+    {
+        assertUpdate("CREATE TABLE test_table_1 AS SELECT 'abcdefg' a", 1);
+        assertUpdate("CREATE VIEW test_view_1 AS SELECT a FROM test_table_1");
+
+        assertQuery("SELECT * FROM test_view_1", "VALUES 'abcdefg'");
+
+        // replace table with a version that's implicitly coercible to the previous one
+        assertUpdate("DROP TABLE test_table_1");
+        assertUpdate("CREATE TABLE test_table_1 AS SELECT 'abc' a", 1);
+
+        assertQuery("SELECT * FROM test_view_1", "VALUES 'abc'");
+
+        assertUpdate("DROP VIEW test_view_1");
+        assertUpdate("DROP TABLE test_table_1");
+    }
+
+    @Test
     public void testViewMetadata()
             throws Exception
     {
@@ -506,7 +525,7 @@ public abstract class AbstractTestDistributedQueries
 
         expected = resultBuilder(getSession(), VARCHAR, VARCHAR, VARCHAR)
                 .row("x", "bigint", "")
-                .row("y", "varchar", "")
+                .row("y", "varchar(3)", "")
                 .build();
 
         assertEquals(actual, expected);

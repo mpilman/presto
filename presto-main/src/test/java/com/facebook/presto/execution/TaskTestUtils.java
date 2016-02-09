@@ -17,7 +17,11 @@ import com.facebook.presto.OutputBuffers;
 import com.facebook.presto.ScheduledSplit;
 import com.facebook.presto.TaskSource;
 import com.facebook.presto.execution.TestSqlTaskManager.MockExchangeClientSupplier;
+import com.facebook.presto.execution.scheduler.LegacyNetworkTopology;
+import com.facebook.presto.execution.scheduler.NodeScheduler;
+import com.facebook.presto.execution.scheduler.NodeSchedulerConfig;
 import com.facebook.presto.index.IndexManager;
+import com.facebook.presto.metadata.InMemoryNodeManager;
 import com.facebook.presto.metadata.MetadataManager;
 import com.facebook.presto.metadata.Split;
 import com.facebook.presto.metadata.TableHandle;
@@ -31,8 +35,9 @@ import com.facebook.presto.sql.gen.ExpressionCompiler;
 import com.facebook.presto.sql.parser.SqlParser;
 import com.facebook.presto.sql.planner.CompilerConfig;
 import com.facebook.presto.sql.planner.LocalExecutionPlanner;
+import com.facebook.presto.sql.planner.NodePartitioningManager;
+import com.facebook.presto.sql.planner.PartitionFunctionBinding;
 import com.facebook.presto.sql.planner.PlanFragment;
-import com.facebook.presto.sql.planner.PlanFragment.PlanDistribution;
 import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.planner.TestingColumnHandle;
 import com.facebook.presto.sql.planner.TestingTableHandle;
@@ -41,6 +46,7 @@ import com.facebook.presto.sql.planner.plan.PlanNodeId;
 import com.facebook.presto.sql.planner.plan.TableScanNode;
 import com.facebook.presto.testing.TestingSplit;
 import com.facebook.presto.testing.TestingTransactionHandle;
+import com.facebook.presto.util.FinalizerService;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 
@@ -49,6 +55,8 @@ import java.util.Optional;
 
 import static com.facebook.presto.SessionTestUtils.TEST_SESSION;
 import static com.facebook.presto.spi.type.VarcharType.VARCHAR;
+import static com.facebook.presto.sql.planner.SystemPartitioningHandle.SINGLE_DISTRIBUTION;
+import static com.facebook.presto.sql.planner.SystemPartitioningHandle.SOURCE_DISTRIBUTION;
 
 public final class TaskTestUtils
 {
@@ -77,10 +85,10 @@ public final class TaskTestUtils
                     TupleDomain.all(),
                     null),
             ImmutableMap.<Symbol, Type>of(SYMBOL, VARCHAR),
-            ImmutableList.of(SYMBOL),
-            PlanDistribution.SOURCE,
+            SOURCE_DISTRIBUTION,
             TABLE_SCAN_NODE_ID,
-            Optional.empty());
+            new PartitionFunctionBinding(SINGLE_DISTRIBUTION, ImmutableList.of(SYMBOL), ImmutableList.of())
+                    .withBucketToPartition(Optional.of(new int[1])));
 
     public static LocalExecutionPlanner createTestingPlanner()
     {
@@ -88,11 +96,23 @@ public final class TaskTestUtils
 
         PageSourceManager pageSourceManager = new PageSourceManager();
         pageSourceManager.addConnectorPageSourceProvider("test", new TestingPageSourceProvider());
+
+        // we don't start the finalizer so nothing will be collected, which is ok for a test
+        FinalizerService finalizerService = new FinalizerService();
+
+        NodeScheduler nodeScheduler = new NodeScheduler(
+                new LegacyNetworkTopology(),
+                new InMemoryNodeManager(),
+                new NodeSchedulerConfig().setIncludeCoordinator(true),
+                new NodeTaskMap(finalizerService));
+        NodePartitioningManager nodePartitioningManager = new NodePartitioningManager(nodeScheduler);
+
         return new LocalExecutionPlanner(
                 metadata,
                 new SqlParser(),
                 pageSourceManager,
                 new IndexManager(),
+                nodePartitioningManager,
                 new PageSinkManager(),
                 new MockExchangeClientSupplier(),
                 new ExpressionCompiler(metadata),
